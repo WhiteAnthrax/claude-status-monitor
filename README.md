@@ -1,6 +1,6 @@
 # claude-status-monitor
 
-XFCE4 パネル（タスクバー）に Claude の**利用状況（クレジット消費）**を簡潔に表示するための小さなツールです。
+XFCE4 パネル（タスクバー）に Claude の**利用枠の残量**を簡潔に表示するための小さなツールです。
 
 ## 何を表示するか
 
@@ -67,7 +67,8 @@ python3 /path/to/claude-status-monitor/claude-usage-genmon.py
 1. パネルを右クリック → 「新しいアイテムの追加」→ **Generic Monitor** を追加。
 2. 追加された GenMon を右クリック → 「プロパティ」。
 3. 次を設定:
-   - **Command**: `python3 /path/to/claude-status-monitor/claude-usage-genmon.py`
+   - **Command**: `/usr/bin/python3 /path/to/claude-status-monitor/claude-usage-genmon.py`
+     （`python3` はフルパス推奨。パネルの実行環境は PATH が最小限のことがあり、素の `python3` だと起動できず空表示になる場合があります。パスは `command -v python3` で確認）
    - **Period (Seconds)**: `300`（= 5分）
    - Label は空 or `Claude` などお好みで。
 
@@ -77,7 +78,7 @@ GenMon インスタンス（例 `plugin-21`）に対して:
 
 ```sh
 DISPLAY=:0 xfconf-query -c xfce4-panel -p /plugins/plugin-21/command \
-  -n -t string -s 'python3 /path/to/claude-status-monitor/claude-usage-genmon.py'
+  -n -t string -s '/usr/bin/python3 /path/to/claude-status-monitor/claude-usage-genmon.py'
 DISPLAY=:0 xfconf-query -c xfce4-panel -p /plugins/plugin-21/update-period \
   -n -t int -s 300000   # 単位はミリ秒（300000 = 300秒）
 DISPLAY=:0 xfconf-query -c xfce4-panel -p /plugins/plugin-21/use-label \
