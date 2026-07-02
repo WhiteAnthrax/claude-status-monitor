@@ -1,0 +1,21 @@
+# 個人設定・機密は絶対にコミットしない
+.credentials.json
+*.credentials.json
+.env
+.env.*
+*.pem
+*.key
+
+# ローカルの利用ログ（誤って持ち込んだ場合の保険）
+*.jsonl
+.claude/
+projects/
+
+# 診断出力（個人パスを含みうる）
+diagnose-out.txt
+
+# OS / エディタ
+__pycache__/
+*.pyc
+.DS_Store
+*.swp
