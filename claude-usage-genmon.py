@@ -6,6 +6,15 @@
 これは /usage コマンドと同じデータで、レートリミット状況の問い合わせのみ
 （プロンプト送信ではない）なので Claude クレジット（利用枠）は消費しない。
 
+アクセストークンが期限切れの場合は、refresh_token でトークン更新を試みる
+（これも推論ではないのでクレジット消費なし）。連打で更新エンドポイントを叩き
+すぎないよう、以下の安全弁を設ける:
+  - 更新はトークンが実際に期限切れの時だけ行う
+  - 最短 MIN_REFRESH_INTERVAL 秒に1回まで（下限）＋失敗時は指数バックオフ
+  - Claude Code 本体と同じ .credentials.json.lock ディレクトリロックで直列化
+    （proper-lockfile 互換）。ロックが取れなければ今回はスキップ。
+  - 更新に成功したトークンはアトミックに書き戻す（他フィールド保持・mode 0600）
+
 フォールバック: 認証切れ・オフライン・エラー時は、ローカルログ
 (~/.claude/projects/**/*.jsonl) からトークン消費量を集計して表示する。
 こちらは完全ローカル・ネット非接続。
@@ -16,6 +25,8 @@
 import glob
 import json
 import os
+import tempfile
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, timezone
@@ -28,8 +39,26 @@ PROJECTS_DIR = os.environ.get(
 )
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-HTTP_TIMEOUT = 4  # 秒。パネルが固まらないよう短めに。
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code の公開 OAuth client_id
+
+HTTP_TIMEOUT = 4          # usage 取得のタイムアウト（パネルを固まらせない）
+REFRESH_TIMEOUT = 8       # トークン更新のタイムアウト
 BLOCK_HOURS = 5
+
+# --- 安全弁 ---------------------------------------------------------------
+MIN_REFRESH_INTERVAL = 300    # 更新試行の下限間隔（秒）。これ未満の連打では更新しない
+MAX_REFRESH_BACKOFF = 3600    # 連続失敗時のバックオフ上限（秒）
+USAGE_CACHE_TTL = 15          # usage 取得結果のキャッシュ秒数（クリック連打の debounce）
+LOCK_STALE = 60               # ロックがこの秒数より古ければ残骸とみなす（安全に破棄）
+LOCK_RETRIES = 10             # ロック取得のリトライ回数（×0.2秒）
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "claude-status-monitor",
+)
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+LOCK_DIR = CREDENTIALS + ".lock"   # proper-lockfile 既定（<file>.lock）に相乗り
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +80,6 @@ def human_duration(td):
 
 
 def parse_ts(raw):
-    """ISO8601(...Z / +00:00) を aware datetime(UTC) に。失敗時 None。"""
     if not raw:
         return None
     try:
@@ -64,33 +92,196 @@ def parse_ts(raw):
 
 
 # ---------------------------------------------------------------------------
-# 公式エンドポイント（第一候補）
+# 状態ファイル（安全弁の記録）
 # ---------------------------------------------------------------------------
-def fetch_official():
-    """/api/oauth/usage を叩いて (txt, tool) を返す。失敗時は None。"""
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    """状態を保存。成功なら True。保存できないなら False（＝更新は見送る判断に使う）。"""
+    tmp = None
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=STATE_DIR, prefix=".state", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+        os.replace(tmp, STATE_FILE)
+        return True
+    except OSError:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 認証情報
+# ---------------------------------------------------------------------------
+def load_oauth():
     try:
         with open(CREDENTIALS, "r", encoding="utf-8") as fh:
-            cred = json.load(fh).get("claudeAiOauth") or {}
-        token = cred.get("accessToken")
-        if not token:
-            return None
-        req = urllib.request.Request(
-            USAGE_URL,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "anthropic-beta": "oauth-2025-04-20",
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-                "User-Agent": "claude-status-monitor",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            return json.load(fh).get("claudeAiOauth") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def is_expired(oauth, now_ms):
+    try:
+        return float(oauth.get("expiresAt", 0)) <= now_ms
+    except (TypeError, ValueError):
+        return True
+
+
+# ---------------------------------------------------------------------------
+# ロック（proper-lockfile 互換の mkdir ディレクトリロック）
+# ---------------------------------------------------------------------------
+def acquire_lock():
+    for _ in range(LOCK_RETRIES):
+        try:
+            os.mkdir(LOCK_DIR)
+            return True
+        except FileExistsError:
+            # 残骸ロックのみ安全に破棄（活きているロックは mtime が更新され続ける）
+            try:
+                if time.time() - os.stat(LOCK_DIR).st_mtime > LOCK_STALE:
+                    os.rmdir(LOCK_DIR)
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.2)
+        except OSError:
+            return False
+    return False
+
+
+def release_lock():
+    try:
+        os.rmdir(LOCK_DIR)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# トークン更新（安全弁つき）
+# ---------------------------------------------------------------------------
+def write_credentials(access_token, refresh_token, expires_at_ms):
+    """全フィールドを保持したままトークンを更新し、アトミックに書き戻す（mode 0600）。"""
+    with open(CREDENTIALS, "r", encoding="utf-8") as fh:
+        full = json.load(fh)
+    oauth = full.setdefault("claudeAiOauth", {})
+    oauth["accessToken"] = access_token
+    if refresh_token:
+        oauth["refreshToken"] = refresh_token
+    oauth["expiresAt"] = int(expires_at_ms)
+
+    dir_ = os.path.dirname(CREDENTIALS) or "."
+    fd, tmp = tempfile.mkstemp(dir=dir_, prefix=".cred", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(full, fh)
+        os.replace(tmp, CREDENTIALS)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def do_refresh(refresh_token, now_ms):
+    """refresh_token で更新エンドポイントを叩き、成功なら書き戻して True。"""
+    body = json.dumps(
+        {"grant_type": "refresh_token", "refresh_token": refresh_token,
+         "client_id": CLIENT_ID}
+    ).encode()
+    req = urllib.request.Request(
+        TOKEN_URL, data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "claude-status-monitor"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=REFRESH_TIMEOUT) as resp:
             data = json.load(resp)
+    except (OSError, ValueError, urllib.error.URLError):
+        return False
+    access = data.get("access_token")
+    expires_in = data.get("expires_in")
+    if not access or not expires_in:
+        return False
+    try:
+        write_credentials(access, data.get("refresh_token"),
+                          now_ms + int(expires_in) * 1000)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def maybe_refresh(now):
+    """安全弁を通した上で、期限切れトークンの更新を試みる。"""
+    now_ms = now * 1000
+    state = load_state()
+    last = state.get("last_refresh_attempt", 0)
+    fails = state.get("refresh_fail_count", 0)
+
+    # 安全弁: 下限間隔＋指数バックオフ。これ未満の間隔では叩かない。
+    wait = MIN_REFRESH_INTERVAL
+    if fails:
+        wait = min(MIN_REFRESH_INTERVAL * (2 ** fails), MAX_REFRESH_BACKOFF)
+    if now - last < wait:
+        return
+
+    if not acquire_lock():
+        return
+    try:
+        # ロック下で再確認: 別プロセスが更新済みなら何もしない
+        oauth = load_oauth()
+        if not is_expired(oauth, now_ms):
+            return
+        refresh_token = oauth.get("refreshToken")
+        if not refresh_token:
+            return
+        # 試行を先に記録（保存できないなら連打防止のため中止）
+        state["last_refresh_attempt"] = now
+        if not save_state(state):
+            return
+        ok = do_refresh(refresh_token, now_ms)
+        state = load_state()
+        state["last_refresh_attempt"] = now
+        state["refresh_fail_count"] = 0 if ok else fails + 1
+        save_state(state)
+    finally:
+        release_lock()
+
+
+# ---------------------------------------------------------------------------
+# 公式エンドポイント
+# ---------------------------------------------------------------------------
+def http_get_usage(token):
+    req = urllib.request.Request(
+        USAGE_URL,
+        headers={"Authorization": f"Bearer {token}",
+                 "anthropic-beta": "oauth-2025-04-20",
+                 "anthropic-version": "2023-06-01",
+                 "Content-Type": "application/json",
+                 "User-Agent": "claude-status-monitor"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            return json.load(resp)
     except (OSError, ValueError, urllib.error.URLError):
         return None
 
+
+def render_official(data):
     def window(obj):
-        """{'utilization':35.0,'resets_at':...} -> (remaining%, reset_dt)"""
         if not isinstance(obj, dict):
             return None, None
         util = obj.get("utilization")
@@ -106,31 +297,56 @@ def fetch_official():
     now = datetime.now(timezone.utc)
 
     def reset_str(dt):
-        if not dt:
-            return "?"
-        return f"{dt.astimezone():%m/%d %H:%M} (残り {human_duration(dt - now)})"
+        return f"{dt.astimezone():%m/%d %H:%M} (残り {human_duration(dt - now)})" if dt else "?"
 
-    # パネル本体: 残り%（少ない方に警告マーク）
     parts = []
     if fh_rem is not None:
         parts.append(f"5h:{fh_rem}%")
     if wk_rem is not None:
         parts.append(f"7d:{wk_rem}%")
     lowest = min([r for r in (fh_rem, wk_rem) if r is not None], default=100)
-    mark = "⚠ " if lowest <= 15 else ""
-    txt = f"{mark}残 " + " ".join(parts)
+    txt = ("⚠ " if lowest <= 15 else "") + "残 " + " ".join(parts)
 
-    tool_lines = ["Claude 残量（公式 /api/oauth/usage・クレジット消費なし）"]
+    lines = ["Claude 残量（公式 /api/oauth/usage・クレジット消費なし）"]
     if fh_rem is not None:
-        tool_lines.append(
-            f"5時間枠: 残り {fh_rem}% (使用 {100 - fh_rem}%)  リセット {reset_str(fh_reset)}"
-        )
+        lines.append(f"5時間枠: 残り {fh_rem}% (使用 {100 - fh_rem}%)  リセット {reset_str(fh_reset)}")
     if wk_rem is not None:
-        tool_lines.append(
-            f"週次(7日): 残り {wk_rem}% (使用 {100 - wk_rem}%)  リセット {reset_str(wk_reset)}"
-        )
-    tool_lines.append(f"取得時刻: {datetime.now():%H:%M:%S}")
-    return txt, "\n".join(tool_lines)
+        lines.append(f"週次(7日): 残り {wk_rem}% (使用 {100 - wk_rem}%)  リセット {reset_str(wk_reset)}")
+    lines.append(f"取得時刻: {datetime.now():%H:%M:%S}")
+    return txt, "\n".join(lines)
+
+
+def fetch_official():
+    now = time.time()
+    now_ms = now * 1000
+
+    # debounce: 直近の成功結果があれば使い回す（クリック連打対策の安全弁）
+    state = load_state()
+    cache = state.get("usage_cache")
+    if cache and now - cache.get("ts", 0) < USAGE_CACHE_TTL:
+        return cache["txt"], cache["tool"]
+
+    oauth = load_oauth()
+    if not oauth.get("accessToken"):
+        return None
+    if is_expired(oauth, now_ms):
+        maybe_refresh(now)          # 安全弁つき更新
+        oauth = load_oauth()        # 更新後を読み直す
+    if is_expired(oauth, now_ms) or not oauth.get("accessToken"):
+        return None                 # まだ切れている → フォールバックへ
+
+    data = http_get_usage(oauth["accessToken"])
+    if data is None:
+        return None
+    rendered = render_official(data)
+    if rendered is None:
+        return None
+
+    txt, tool = rendered
+    state = load_state()
+    state["usage_cache"] = {"ts": now, "txt": txt, "tool": tool}
+    save_state(state)
+    return txt, tool
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +429,12 @@ def local_fallback():
 
 # ---------------------------------------------------------------------------
 def main():
-    result = fetch_official() or local_fallback()
+    try:
+        result = fetch_official()
+    except Exception:
+        result = None
+    if result is None:
+        result = local_fallback()
     txt, tool = result
     print(txt)
     print(f"<txt>{txt}</txt>")
